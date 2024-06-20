@@ -248,6 +248,16 @@ def extract1d(image, var_poisson, var_rnoise, var_flat, lambdas, disp_range,
     # lambdas, temp_flux, background, npixels, and the arrays in
     # srclim and bkglim.
     x = disp_range[0]
+
+    if nbkglim == 0:
+        (temp_flux, f_var_poisson, f_var_rnoise, f_var_flat,
+         npixels, twht) = _extract_all_src_fluxes(image, var_poisson,
+                                                  var_rnoise, var_flat,
+                                                  lambdas, srclim, disp_range)
+        return (temp_flux, f_var_poisson, f_var_rnoise, f_var_flat,
+            background, b_var_poisson, b_var_rnoise, b_var_flat, npixels)
+
+    
     for j in range(nl):
         lam = lambdas[j]
 
@@ -807,3 +817,168 @@ def _coalesce_bounds(segments):
         cint.append(interval)
 
     return cint
+
+
+
+
+def _remove_overlaps(lims):
+
+
+    """
+    Similar to _coalesce_bounds, but in numpy form and operating on
+    all wavelengths simultaneously.
+    """
+    
+    try:
+        x = np.transpose(np.asarray(lims), axes=(2, 0, 1))
+        assert(len(x.shape) == 3 and x.shape[-1] == 2)
+    except:
+        raise ValueError("Cannot make an nlam x nintervals x 2 array from limits")
+            
+    x = np.sort(x, axis=-1)
+
+    # And now sort by the first element i1 in each range [i1, i2]
+    # I didn't find a more efficient/elegant way than the lines below.
+    
+    i = x[:, :, 0].argsort()
+    
+    y = x*1.
+    r = np.arange(y.shape[0])
+    
+    for j in range(y.shape[1]):
+        y[:, j, 0] = x[..., 0][r, i[:, j]]
+        y[:, j, 1] = x[..., 1][r, i[:, j]]
+        
+    x = y
+
+    # Now ensure that the limits don't overlap.  Don't bother to
+    # consolidate; that would save negligible time later.
+    
+    for i in range(x.shape[1] - 1):
+        # First, remove an overlap by extending the lower bound of the
+        # upper interval.
+
+        overlaps = x[:, i, 1] > x[:, i + 1, 0]
+        x[:, i + 1, 0][overlaps] = x[:, i, 1][overlaps]
+        
+        # If the lower bound of the upper interval is now higher than
+        # its upper bound, extend the lower bound to be equal to the
+        # upper bound so that the interval now contains zero area.
+
+        nulled = x[:, i + 1, 0] > x[:, i + 1, 1]
+        x[:, i + 1, 1][nulled] = x[:, i + 1, 0][nulled]
+        
+    return x
+
+
+def _makemask(shape, lims):
+
+    """
+    Turn the bounds output from _remove_overlaps into a weight mask.
+    This avoids the need to call _extract_colpix.  The mask will be
+    constructed using numpy advanced indexing for efficiency.
+    """
+    
+    x = np.zeros(shape)
+
+    # don't go outside the bounds of the array
+    eps = 1e-10  # should result in a different from zero when added to the shape
+    lims[..., 0][lims[..., 0] <= -0.5] = -0.5 + eps
+    lims[..., 1][lims[..., 1] >= shape[1] - 0.5] = shape[1] - 0.5 - eps
+
+    # Loop over the sets of intervals (typically one or two)
+    
+    for k in range(lims.shape[1]):
+        
+        i1 = np.round(lims[:, k, 0]).astype(int)
+        i2 = np.round(lims[:, k, 1]).astype(int)
+        
+        wgt1 = 0.5 + i1 - lims[:, k, 0]
+        wgt2 = 0.5 + lims[:, k, 1] - i2
+
+        # remove double counting if the index is repeated
+        wgt1[i2 == i1] -= 1
+
+        # get the endpoints
+        x[i1, np.arange(len(lims))] += wgt1
+        x[i2, np.arange(len(lims))] += wgt2
+
+        # and get the interior points
+        for i in range(1, x.shape[0]):
+            ok = i1 + i < i2
+            # stop if we are done with interior points in all intervals
+            if np.sum(ok) == 0:
+                break
+            x[(i1 + i)[ok], np.arange(len(lims))[ok]] += 1
+    return x
+
+def _extract_all_src_fluxes(image, var_poisson, var_rnoise, var_flat,
+                            lam, srclim, disp_range, weights=None):
+
+    """
+    Replacement for _extract_src_flux, operating on all wavelengths
+    simultaneously.  Does not currently include a background fit but
+    can straightforwardly do so once we decide how that should be done.
+    """
+
+    # Get the extraction limits in the form that _makemask needs.
+    
+    lims = _remove_overlaps(srclim)
+    i1, i2 = disp_range
+
+    # Don't do math over an unnecessarily large array.  Cut it down
+    # to the size needed if it is too big.
+    
+    j1 = int(max(np.amin(lims), 0))
+    j2 = int(min(np.amax(lims) + 2, image.shape[0]))
+
+    im = image[:, i1:i2]*1.
+    mask = _makemask(im.shape, lims)
+
+    im = im[j1:j2]
+    mask = mask[j1:j2]
+
+    # Make copies of appropriately sized subarrays, replacing all
+    # nonfinite pixels (that would screw up sums) with zeros.
+    
+    bad = ~np.isfinite(im)
+    im[bad] = 0
+    vp = var_poisson[j1:j2, i1:i2]*1.
+    vp[bad] = 0
+    vr = var_rnoise[j1:j2, i1:i2]*1.
+    vr[bad] = 0
+    vf = var_flat[j1:j2, i1:i2]*1.
+    vf[bad] = 0
+
+    # All extracted quantities may be written similarly to this one: a
+    # sum along the zero axis of the mask times the array of interest.
+    
+    area = np.sum(mask*(~bad), axis=0)
+
+    # The code below will work best if weights is able to take 
+    # 2D broadcastable functions for wavelength and y position.
+    # Assuming the weight function to be written in this
+    # sufficiently general way, the step below will be very
+    # fast.  If not, it will have a slow loop.
+    
+    if weights is not None:
+        y, _ = np.meshgrid(np.arange(image.shape[1]), np.arange(image.shape[0]))
+        try:
+            wgt = weights(lam[np.newaxis, :], y[j1:j2, i1:i2])
+            mask *= wgt
+        except:
+            for i in range(i1, i2):
+                mask[:, i] *= weights(lam[i], y[:, i])
+
+    mwht = np.sum(mask*(~bad), axis=0)/np.sum(mask*(~bad) > 0, axis=0)
+    total_flux = np.sum(im*mask, axis=0)/mwht
+    f_var_poisson = np.sum(vp*mask, axis=0)/mwht
+    f_var_rnoise = np.sum(vr*mask, axis=0)/mwht
+    f_var_flat = np.sum(vf*mask, axis=0)/mwht
+    
+    # This will be the same as area unless the mask was modified by
+    # weights, in which case it will differ.
+    
+    twht = np.sum(mask*(~bad), axis=0)
+
+    return (total_flux, f_var_poisson, f_var_rnoise, f_var_flat, area, twht)
