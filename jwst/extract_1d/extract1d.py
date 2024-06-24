@@ -852,11 +852,15 @@ def _remove_overlaps(lims):
     x = y
 
     # Now ensure that the limits don't overlap.  Don't bother to
-    # consolidate; that would save negligible time later.
+    # consolidate into a smaller number of intervals.  That would save
+    # negligible time later, and it could break the ndarray assumption
+    # that each pixel has the same number of intervals.
     
     for i in range(x.shape[1] - 1):
-        # First, remove an overlap by extending the lower bound of the
-        # upper interval.
+        
+        # First, remove an overlap by increasing the lower bound of the
+        # upper interval.  No guarantee that this will make a valid
+        # interval; we will take care of that possibility next.
 
         overlaps = x[:, i, 1] > x[:, i + 1, 0]
         x[:, i + 1, 0][overlaps] = x[:, i, 1][overlaps]
@@ -873,16 +877,23 @@ def _remove_overlaps(lims):
 
 def _makemask(shape, lims):
 
-    """
+    """.
+    
     Turn the bounds output from _remove_overlaps into a weight mask.
     This avoids the need to call _extract_colpix.  The mask will be
-    constructed using numpy advanced indexing for efficiency.
+    constructed using numpy advanced indexing for efficiency.  Most
+    weights will be one.
+    
+
     """
     
     x = np.zeros(shape)
 
     # don't go outside the bounds of the array
     eps = 1e-10  # should result in a different from zero when added to the shape
+    # This simply ensure taht rounding will round no lower than zero and
+    # no higher than the largest possible index value.
+    
     lims[..., 0][lims[..., 0] <= -0.5] = -0.5 + eps
     lims[..., 1][lims[..., 1] >= shape[1] - 0.5] = shape[1] - 0.5 - eps
 
@@ -897,19 +908,27 @@ def _makemask(shape, lims):
         wgt2 = 0.5 + lims[:, k, 1] - i2
 
         # remove double counting if the index is repeated
+        # (in that case wgt1 + wgt2 = 1 + lims[..., 1] - lims[..., 0])
+        
         wgt1[i2 == i1] -= 1
 
-        # get the endpoints
+        # Apply the weights to the endpoints
+        
         x[i1, np.arange(len(lims))] += wgt1
         x[i2, np.arange(len(lims))] += wgt2
 
-        # and get the interior points
+        # And now apply unit weights to the interior points
+        
         for i in range(1, x.shape[0]):
             ok = i1 + i < i2
-            # stop if we are done with interior points in all intervals
+            
+            # Stop if there are no more interior points in any interval
+            
             if np.sum(ok) == 0:
                 break
+            
             x[(i1 + i)[ok], np.arange(len(lims))[ok]] += 1
+            
     return x
 
 def _extract_all_src_fluxes(image, var_poisson, var_rnoise, var_flat,
