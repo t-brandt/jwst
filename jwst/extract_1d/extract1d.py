@@ -251,9 +251,9 @@ def extract1d(image, var_poisson, var_rnoise, var_flat, lambdas, disp_range,
 
     if nbkglim == 0:
         (temp_flux, f_var_poisson, f_var_rnoise, f_var_flat,
-         npixels, twht) = _extract_all_src_fluxes(image, var_poisson,
-                                                  var_rnoise, var_flat,
-                                                  lambdas, srclim, disp_range)
+         npixels) = _extract_all_src_fluxes(image, var_poisson,
+                                            var_rnoise, var_flat,
+                                            lambdas, srclim, disp_range)
         return (temp_flux, f_var_poisson, f_var_rnoise, f_var_flat,
             background, b_var_poisson, b_var_rnoise, b_var_flat, npixels)
 
@@ -979,25 +979,35 @@ def _extract_all_src_fluxes(image, var_poisson, var_rnoise, var_flat,
     # Assuming the weight function to be written in this
     # sufficiently general way, the step below will be very
     # fast.  If not, it will have a slow loop.
-    
+
     if weights is not None:
+        wgt = (mask > 0)*1.
         y, _ = np.meshgrid(np.arange(image.shape[1]), np.arange(image.shape[0]))
         try:
-            wgt = weights(lam[np.newaxis, :], y[j1:j2, i1:i2])
-            mask *= wgt
+            wgt *= weights(lam[np.newaxis, :], y[j1:j2, i1:i2])
         except:
             for i in range(i1, i2):
-                mask[:, i] *= weights(lam[i], y[:, i])
+                wgt[:, i - i1] *= weights(lam[i - i1], y[j1:j2, i])
 
-    mwht = np.sum(mask*(~bad), axis=0)/np.sum(mask*(~bad) > 0, axis=0)
-    total_flux = np.sum(im*mask, axis=0)/mwht
-    f_var_poisson = np.sum(vp*mask, axis=0)/mwht
-    f_var_rnoise = np.sum(vr*mask, axis=0)/mwht
-    f_var_flat = np.sum(vf*mask, axis=0)/mwht
+        # The line below makes this optimal extraction.
+        # The previous implementation, normalizing by the average value of
+        # the weight, does not make sense to me, as it would give a different
+        # value depending on aperture size if the weights go to zero towards
+        # the edge of the aperture.
+        
+        wgt /= np.sum(wgt**2*mask, axis=0)[np.newaxis, :]
+        
+    else:
+        wgt = 1
     
-    # This will be the same as area unless the mask was modified by
-    # weights, in which case it will differ.
-    
-    twht = np.sum(mask*(~bad), axis=0)
+    total_flux = np.sum(im*mask*wgt, axis=0)
+    f_var_poisson = np.sum(vp*mask*wgt, axis=0)
+    f_var_rnoise = np.sum(vr*mask*wgt, axis=0)
+    f_var_flat = np.sum(vf*mask*wgt, axis=0)
 
-    return (total_flux, f_var_poisson, f_var_rnoise, f_var_flat, area, twht)
+    # The current pipeline sets values to NaN if no pixels contribute to a measurement.
+    # Should really make the variances infinite in this case.
+    
+    total_flux[np.sum(mask, axis=0) == 0] = np.nan
+    
+    return (total_flux, f_var_poisson, f_var_rnoise, f_var_flat, area)
