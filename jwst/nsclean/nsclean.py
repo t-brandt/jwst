@@ -216,8 +216,10 @@ def clean_full_frame(detector, image, mask):
     return cleaned_image
 
 
-def clean_subarray(detector, image, mask, npix_iter=512,
-                   exclude_outliers=True, sigrej=4, minfrac=0.05):
+def clean_subarray(detector, image, weight, npix_iter=512,
+                   exclude_outliers=True, sigrej=4, minfrac=0.05,
+                   align=True, corr_inplace=True,
+                   fc=(1061, 1211, 49943, 49957)):
     """Clean a subarray image.
 
     Parameters
@@ -228,8 +230,9 @@ def clean_subarray(detector, image, mask, npix_iter=512,
     image : 2D float array
         The image to be cleaned.
 
-    mask : 2D bool array
-        The mask that indicates which pixels are to be used in fitting.
+    weight : 2D float array
+        Weights for pixels to be used in fitting for 1/f noise.  Pixels
+        with zero weight will not be used.
 
     npix_iter : int
         Number of pixels to process simultaneously.  Default 512.  Should
@@ -243,10 +246,25 @@ def clean_subarray(detector, image, mask, npix_iter=512,
     sigrej : float
         Number of sigma to clip when identifying outliers.  Default 4.
 
-    minpct : float
+    minfrac : float
         Minimum fraction of pixels locally available in the mask in
         order to attempt a correction.  Default 0.05 (i.e., 5%).
-        
+
+    align : bool
+        Flip and rotate the image based on the detector argument?
+        Default True.
+    
+    corr_inplace : bool
+        Apply the 1/f correction in place?  If not, return the model
+        of 1/f noise rather than the corrected image.
+
+    fc : tuple of four floats
+        Cut-on and cut-off frequencies for 1/f correction.  Full
+        correction will be applied for frequencies <fc[0] and >fc[-1];
+        no correction will be applied for frequencies >fc[1] and <fc[2].
+        Default (1061, 1211, 49943, 49957).  Units are Hz, pixel rate is
+        100 kHZ, or 100000.
+    
     Returns
     -------
     cleaned_image : 2D float array
@@ -255,13 +273,17 @@ def clean_subarray(detector, image, mask, npix_iter=512,
 
     # Flip the image to detector coords. NRS1 requires a transpose
     # of the axes, while NRS2 requires a transpose and flip.
-    if detector == "NRS1":
-        image = image.transpose()
-        mask = mask.transpose()
-    else:
-        image = image.transpose()[::-1]
-        mask = mask.transpose()[::-1]
+    if align:
+        if detector == "NRS1":
+            image = image.transpose()
+            weight = weight.transpose()
+        elif detector == "NRS2":
+            image = image.transpose()[::-1]
+            weight = weight.transpose()[::-1]
 
+    weight = weight*1.
+    mask = weight != 0
+    
     # We must do the masking of discrepant pixels here: it just
     # doesn't work if we wait and do it in the cleaner.  This is
     # basically copied from lib.py.  Use a robust estimator for
@@ -281,7 +303,8 @@ def clean_subarray(detector, image, mask, npix_iter=512,
         mask[:, 1:] = mask[:, 1:]&(~outlier[:, :-1])
         mask[:, :-1] = mask[:, :-1]&(~outlier[:, 1:])
             
-
+    weight[~mask] = 0
+        
     # Used to determine the fitting intervals along the slow scan
     # direction.  Pre-pend a zero so that we sum_mask[i] is equal
     # to np.sum(mask[:i], axis=1).
@@ -314,8 +337,8 @@ def clean_subarray(detector, image, mask, npix_iter=512,
         # and standard deviation.
         
         if np.mean(mask[i1:i1 + di]) > minfrac:
-            cleaner = NSCleanSubarray(image[i1:i1 + di], mask[i1:i1 + di],
-                                      exclude_outliers=False)
+            cleaner = NSCleanSubarray(image[i1:i1 + di], weight[i1:i1 + di],
+                                      exclude_outliers=False, fc=fc)
             models += [cleaner.clean(return_model=True)]
         else:
             log.warning("Insufficient reference pixels for NSClean around "
@@ -347,19 +370,33 @@ def clean_subarray(detector, image, mask, npix_iter=512,
         tot_wgt[i1_vals[i]:i1_vals[i] + di_list[i]] += wgt
         
     model /= tot_wgt
-    cleaned_image = image - model
 
-    # Restore the cleaned image to the science frame
-    if detector == "NRS1":
-        cleaned_image = cleaned_image.transpose()
+    if corr_inplace:
+        cleaned_image = image - model
+        
+        # Restore the cleaned image to the science frame
+        if align:
+            if detector == "NRS1":
+                cleaned_image = cleaned_image.transpose()
+            elif detector == "NRS2":
+                cleaned_image = cleaned_image[::-1].transpose()
+            
+        return cleaned_image
+
     else:
-        cleaned_image = cleaned_image[::-1].transpose()
+        if align:
+            if detector == "NRS1":
+                model = model.transpose()
+            elif detector == "NRS2":
+                model = model[::-1].transpose()
+        return model
+        
 
-    return cleaned_image
-
-
-def do_correction(input_model, mask_spectral_regions, n_sigma, save_mask, user_mask):
-
+def do_correction(input_model, mask_spectral_regions, n_sigma, save_mask, user_mask,
+                  npix_iter=1024, exclude_outliers=True, sigrej=3,
+                  minfrac_subarray=0.1, minfrac_fullarray=0.3,
+                  expand_mask=True, filter_sig=5, threshold=0.2,
+                  subchannelmean=True):
     """Apply the NSClean 1/f noise correction
 
     Parameters
@@ -378,6 +415,47 @@ def do_correction(input_model, mask_spectral_regions, n_sigma, save_mask, user_m
 
     user_mask : str or None
         Path to user-supplied mask image
+    
+    npix_iter : int
+        Number of pixels to process simultaneously.  Default 512.  Should
+        be at least a few hundred to access sub-kHz frequencies in areas
+        where most pixels are available for fitting.  Previous default
+        behavior corresponds to npix_iter of infinity.
+
+    exclude_outliers : bool
+        Find and mask outliers in the fit?  Default True
+
+    sigrej : float
+        Number of sigma to clip when identifying outliers.  Default 4.
+
+    minfrac_subarray : float
+        Minimum fraction of pixels locally available in the mask in
+        order to attempt a correction for a subarray.  Default 0.1
+        (i.e., 10%).
+
+    minfrac_fullarray : float
+        Minimum fraction of pixels locally available in the mask in
+        order to attempt a correction for a full frame.  Default 0.3
+        (i.e., 30%).
+
+    expand_mask : bool
+        Locally expand the mask to flag pixels where a large fraction of
+        neighbors are flagged as illuminated.  Mitigates the problem of
+        using too many pixels near bright objects.  Only used in full
+        array mode.  Default True.
+
+    filter_sig : float
+        Radius to use for looking for flagged neighboring pixels.  Only
+        used if expand_mask is True.  Default 5.
+    
+    threshold : float
+        Maximum fraction of neighbors that have illumination for a pixel
+        to remain available for 1/f fitting.  Only used if expand_mask is
+        True.  Default 0.2.
+
+    subchannelmean : bool
+        Subtract the mean of each channel over the available unilluminated
+        pixels?  Only applies to full frame data.  Default True. 
 
     Returns
     -------
@@ -454,11 +532,28 @@ def do_correction(input_model, mask_spectral_regions, n_sigma, save_mask, user_m
             mask = Mask
 
         if input_model.data.shape[-2:] == (2048, 2048):
-            # Clean a full-frame image
-            cleaned_image = clean_full_frame(detector, image, mask)
+            # Clean a full-frame image.  I will do this in two stages.
+            # First, I will use the four output channels combined to
+            # fit the low-ish frequencies.  Then I will use each channel
+            # to fit the very lowest frequencies of noise.
+            
+            cleaned_image, mask = clean_full_frame_alt(detector, image, mask,
+                                                       exclude_outliers=exclude_outliers, sigrej=sigrej, npix_iter=npix_iter, minfrac=minfrac_fullarray,
+                                                       expand_mask=expand_mask, filter_sig=filter_sig, threshold=threshold, subchannelmean=subchannelmean, fc=(600, 700, 49943, 49957))
+            
+            cleaned_image, mask = clean_full_frame_alt(detector, cleaned_image, mask,
+                                                       npix_iter=npix_iter,
+                                                       minfrac=minfrac_fullarray,
+                                                       chan_wgt=20,
+                                                       exclude_outliers=False,
+                                                       expand_mask=False,
+                                                       subchannelmean=subchannelmean,
+                                                       fc=(90, 100, 51000, 52000))
+
         else:
             # Clean a subarray image
-            cleaned_image = clean_subarray(detector, image, mask)
+            cleaned_image = clean_subarray(detector, image, mask,
+                                           minfrac=minfrac_subarray)
 
         # Check for failure
         if cleaned_image is None:
@@ -478,3 +573,196 @@ def do_correction(input_model, mask_spectral_regions, n_sigma, save_mask, user_m
     output_model.meta.cal_step.nsclean = 'COMPLETE'
 
     return output_model, mask_model
+
+
+
+def clean_full_frame_alt(detector, image, mask, npix_iter=1024, chan_wgt=1,
+                         exclude_outliers=True, sigrej=3, minfrac=0.3, 
+                         expand_mask=True, filter_sig=5, threshold=0.2, 
+                         subchannelmean=True, fc=(600, 700, 49943, 49957)):
+
+    """Clean a full-frame (2048x2048) image.
+
+    Parameters
+    ----------
+    detector : str
+        The name of the detector from which the data originate.
+
+    image : 2D float array
+        The image to be cleaned.
+
+    mask : 2D bool array
+        Boolean mask of pixels to be used to compute the 1/f correction.
+
+    npix_iter : int
+        Number of pixels to process simultaneously.  Default 512.  Should
+        be at least a few hundred to access sub-kHz frequencies in areas
+        where most pixels are available for fitting.  Previous default
+        behavior corresponds to npix_iter of infinity.
+
+    chan_wgt : float
+        How strongly to weight a channel relative to the other channels
+        when computing a correction.  chan_wgt=1 means weight all
+        channels equally, so that the same 1/f correction applies to each
+        of them.  chan_wgt=infinity means only use this channel for its
+        correction.  Default 1.
+    
+    exclude_outliers : bool
+        Find and mask outliers in the fit?  Default True
+
+    sigrej : float
+        Number of sigma to clip when identifying outliers.  Default 4.
+
+    minfrac : float
+        Minimum fraction of pixels locally available in the mask in
+        order to attempt a correction.  Default 0.3 (i.e., 30%).
+
+    expand_mask : bool
+        Locally expand the mask to flag pixels where a large fraction of
+        neighbors are flagged as illuminated.  Mitigates the problem of
+        using too many pixels near bright objects.  Only used in full
+        array mode.  Default True.
+
+    filter_sig : float
+        Radius to use for looking for flagged neighboring pixels.  Only
+        used if expand_mask is True.  Default 5.
+    
+    threshold : float
+        Maximum fraction of neighbors that have illumination for a pixel
+        to remain available for 1/f fitting.  Only used if expand_mask is
+        True.  Default 0.2.
+
+    subchannelmean : bool
+        Subtract the mean of each channel over the available unilluminated
+        pixels?  Default True. 
+    
+    fc : tuple of four floats
+        Cut-on and cut-off frequencies for 1/f correction.  Full
+        correction will be applied for frequencies <fc[0] and >fc[-1];
+        no correction will be applied for frequencies >fc[1] and <fc[2].
+        Default (600, 700, 49943, 49957).  Units are Hz, pixel rate is
+        100 kHz.  
+    
+    Returns
+    -------
+    cleaned_image : 2D float array
+        The cleaned image.
+
+    mask : 2D boolean array
+        The mask of pixels used to compute the correction.
+
+    """
+    
+    if detector == "NRS1":
+        image = image.transpose()
+        mask = mask.transpose()
+    elif detector == "NRS2":
+        image = image.transpose()[::-1]
+        mask = mask.transpose()[::-1]
+
+    # Make sure we aren't using the reference pixels; they should have
+    # already been used for the SIRS correction and have nothing more
+    # to offer.
+    
+    mask[:4] = mask[-4:] = mask[:, :4] = mask[:, -4:] = False
+
+    # Mask outliers.  This is currently done in Bernie's routine in lib.py,
+    # and is moved here, with outlier flagging set to False later.
+    
+    if exclude_outliers:
+        med = np.median(image[mask])
+        std = 1.4825*np.median(np.abs((image - med)[mask]))
+        outlier = mask&(np.abs(image - med) > sigrej*std)
+        
+        mask = mask&(~outlier)
+        
+        # also get four nearest neighbors of flagged pixels
+        mask[1:] = mask[1:]&(~outlier[:-1])
+        mask[:-1] = mask[:-1]&(~outlier[1:])
+        mask[:, 1:] = mask[:, 1:]&(~outlier[:, :-1])
+        mask[:, :-1] = mask[:, :-1]&(~outlier[:, 1:])
+
+    # Expand the mask by looking at the neighbors of candidate
+    # background pixels.  Pixels survive, and can still be in the
+    # mask, if <threshold of their neighbors are flagged as outliers
+    # or illuminated.
+    
+    if expand_mask:
+        filter = np.arange(-2*filter_sig, 2*filter_sig + 1)
+        filter = np.exp(-filter**2/(2*filter_sig**2))
+        filter /= np.sum(filter)
+        
+        filtered_mask = 1 - mask*1.
+        # The array below takes care of edge effects from the incomplete convolution.
+        norm = np.ones(mask.shape)
+        for i in range(4, mask.shape[0] - 4):
+            filtered_mask[i, 4:-4] = np.convolve(filtered_mask[i, 4:-4], filter, mode='same')
+            norm[i, 4:-4] = np.convolve(norm[i, 4:-4], filter, mode='same')
+        for i in range(4, mask.shape[1] - 4):
+            filtered_mask[4:-4, i] = np.convolve(filtered_mask[4:-4, i], filter, mode='same')
+            norm[4:-4, i] = np.convolve(norm[4:-4, i], filter, mode='same')
+
+        filtered_mask /= norm
+
+        mask = mask&(filtered_mask < threshold)
+
+    masked = image*mask
+
+    # Compute the correction channel-by-channel.  This only needs to
+    # be done once if the channels are being equally weighted.
+    
+    for ichan in range(4):
+        
+        # If chan_wgt==1, all channels are weighted equally; the model
+        # will be the same for all of them.  In that case we only need
+        # to compute it once.  Weights for the unmasked pixels are one
+        # for channels other than the one to be fitted, and chan_wgt
+        # for the channel being fitted.
+        
+        if ichan == 0 or chan_wgt != 1:
+            weights = mask[:, :512]*0.
+            refchan = weights*0.
+            for i in range(4):
+                if i == ichan:
+                    w = chan_wgt
+                else:
+                    w = 1
+                    
+                # Readout directions are opposite for alternating channels.
+                if i%2 == 0:
+                    weights += mask[:, 512*i:512*(i + 1)]*w
+                    refchan += masked[:, 512*i:512*(i + 1)]*w
+                else:
+                    weights += mask[:, 512*i:512*(i + 1)][:, ::-1]*w
+                    refchan += masked[:, 512*i:512*(i + 1)][:, ::-1]*w
+
+            # Back to units of counts or count rate for the fitting
+            # the reference channel that we have partially filled.
+            # Add a very small number to prevent division by zero.
+            
+            refchan /= weights + 1e-100
+            model = clean_subarray(detector, refchan[4:-4], weights[4:-4],
+                                   npix_iter=npix_iter,
+                                   exclude_outliers=False, minfrac=minfrac,
+                                   align=False, corr_inplace=False, fc=fc)
+
+        # Readout directions are opposite for alternating channels.
+        # Don't modify the reference pixels on the ends of each
+        # channel.
+        
+        if ichan%2 == 0:
+            image[4:-4, ichan*512:(ichan + 1)*512] -= model
+        else:
+            image[4:-4, ichan*512:(ichan + 1)*512] -= model[:, ::-1]
+
+        if subchannelmean:
+            image[4:-4, ichan*512:(ichan + 1)*512] -= np.mean(image[4:-4, ichan*512:(ichan + 1)*512][mask[4:-4, ichan*512:(ichan + 1)*512]])
+        
+    if detector == "NRS1":
+        image = image.transpose()
+        mask = mask.transpose()
+    elif detector == "NRS2":
+        image = image[::-1].transpose()
+        mask = mask[::-1].transpose()
+            
+    return image, mask

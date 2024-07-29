@@ -337,7 +337,7 @@ class NSCleanSubarray:
     sigrej = np.float32(4.0)  # Standard deviation threshold for flagging
                               #   statistical outliers.
 
-    def __init__(self, data, mask, fc=(1061, 1211, 49943, 49957),
+    def __init__(self, data, weight, fc=(1061, 1211, 49943, 49957),
                  exclude_outliers=True, weights_kernel_sigma=None):
         """
         Background modeling and subtraction for generic JWST near-IR subarrays.
@@ -347,9 +347,9 @@ class NSCleanSubarray:
         data : float array
             The 2D input image data array to be operated on.
 
-        mask : bool array
-            The background model is fitted to pixels set to True.
-            Pixels set to False are ignored.
+        weight : float array
+            The background model is fitted to pixels with nonzero weight.
+            Pixels with weights set to zero are ignored.
 
         fc : tuple
             Apodizing filter definition. These parameters are tunable. They
@@ -378,7 +378,8 @@ class NSCleanSubarray:
         """
         # Definitions
         self.data = np.array(data, dtype=np.float32)
-        self.mask = np.array(mask, dtype=np.bool_)
+        self.mask = np.array(weight != 0, dtype=np.bool_)
+        self.weight = np.array(weight, dtype=np.float32)
         self.ny = np.int32(data.shape[0])  # Number of pixels in slow scan direction
         self.nx = np.int32(data.shape[1])  # Number of pixels in fast scan direction
         self.fc = np.array(fc, dtype=np.float32)
@@ -468,7 +469,7 @@ class NSCleanSubarray:
         _y = np.arange(self.ny).reshape((-1,1))
         m = (_y*(self.nx+self.nloh) + _x)[self.mask].reshape((-1,1))
 
-        # Define which Fourier vectors to fit. For consistency with numpy, call this k.
+        # Define which Fourier vectors to fit. For consistency with numpy, callthis k.
         k = np.arange(len(self.rfftfreq))[self.apodizer>0.].reshape((1,-1))
 
         # Build the incomplete Fourier matrix
@@ -485,10 +486,10 @@ class NSCleanSubarray:
             _sigma = np.float32(self.weights_kernel_sigma) # Standard deviation of Gaussian
             W = np.exp(-(_x-_mu)**2/_sigma**2/2)/_sigma/np.sqrt(2*np.pi) # Build centered Gaussian
             FW = np.fft.rfft(np.fft.ifftshift(W)) # Forward FFT
-            _M = np.hstack((self.mask, np.zeros((self.ny,self.nloh), dtype=np.bool_))).flatten() # Add new line overhead to mask
+            _M = np.hstack((self.weight, np.zeros((self.ny,self.nloh), dtype=np.float32))).flatten() # Add new line overhead to weight
             with np.errstate(divide='ignore'):
-                P = 1/np.fft.irfft(np.fft.rfft(np.array(_M, dtype=np.float32)) * FW, self.n) # Compute weights
-            P = P[_M] # Keep only background samples
+                P = 1/np.fft.irfft(np.fft.rfft(np.array(_M)) * FW, self.n) # Compute weights
+            P = P[_M != 0] # Keep only background samples
 
             # NSClean's weighting requires the Moore-Penrose invers of A = P*B.
             #     $A^+ = (A^H A)^{-1} A^H$
