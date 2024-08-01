@@ -396,7 +396,7 @@ def do_correction(input_model, mask_spectral_regions, n_sigma, save_mask, user_m
                   npix_iter=1024, exclude_outliers=True, sigrej=3,
                   minfrac_subarray=0.1, minfrac_fullarray=0.3,
                   expand_mask=True, filter_sig=5, threshold=0.2,
-                  subchannelmean=True):
+                  aggressiveness=0):
     """Apply the NSClean 1/f noise correction
 
     Parameters
@@ -453,9 +453,12 @@ def do_correction(input_model, mask_spectral_regions, n_sigma, save_mask, user_m
         to remain available for 1/f fitting.  Only used if expand_mask is
         True.  Default 0.2.
 
-    subchannelmean : bool
-        Subtract the mean of each channel over the available unilluminated
-        pixels?  Only applies to full frame data.  Default True. 
+    aggressiveness : float
+        How aggressive a 1/f subtraction should we do?  Goes from a
+        minimum of zero (which will be similar to the median-based
+        correction) to 11, which will suppress significantly more noise
+        if there is a good background model and much of the frame is
+        read-noise-limited.
 
     Returns
     -------
@@ -479,6 +482,10 @@ def do_correction(input_model, mask_spectral_regions, n_sigma, save_mask, user_m
 
     output_model = input_model.copy()
 
+    if not (aggressiveness >= 0 and aggressiveness <= 11):
+        raise ValueError("Argument aggressiveness to do_correction should be "
+                         "between 0 and 11 (inclusive)")
+    
     # Check for a user-supplied mask image. If so, use it.
     if user_mask is not None:
         mask_model = datamodels.open(user_mask)
@@ -498,15 +505,6 @@ def do_correction(input_model, mask_spectral_regions, n_sigma, save_mask, user_m
         # pixels per integration.
         log.info("Creating mask")
         Mask, nan_pix = create_mask(input_model, mask_spectral_regions, n_sigma)
-
-        # Store the mask image in a model, if requested
-        if save_mask:
-            if len(Mask.shape) == 3:
-                mask_model = datamodels.CubeModel(data=Mask)
-            else:
-                mask_model = datamodels.ImageModel(data=Mask)
-        else:
-            mask_model = None
 
     log.info(f"Cleaning image {input_model.meta.filename}")
 
@@ -536,19 +534,31 @@ def do_correction(input_model, mask_spectral_regions, n_sigma, save_mask, user_m
             # First, I will use the four output channels combined to
             # fit the low-ish frequencies.  Then I will use each channel
             # to fit the very lowest frequencies of noise.
-            
+
+            f1a = aggressiveness*600/11 + 10
+            f1b = aggressiveness*700/11 + 20
+            if aggressiveness > 5:
+                f2a, f2b = 49943, 49957
+            else:
+                f2a, f2b = 51000, 52000
+            if aggressiveness > 10:
+                subchannelmean = True
+            else:
+                subchannelmean = False
+                
             cleaned_image, mask = clean_full_frame_alt(detector, image, mask,
                                                        exclude_outliers=exclude_outliers, sigrej=sigrej, npix_iter=npix_iter, minfrac=minfrac_fullarray,
-                                                       expand_mask=expand_mask, filter_sig=filter_sig, threshold=threshold, subchannelmean=subchannelmean, fc=(600, 700, 49943, 49957))
-            
-            cleaned_image, mask = clean_full_frame_alt(detector, cleaned_image, mask,
-                                                       npix_iter=npix_iter,
-                                                       minfrac=minfrac_fullarray,
-                                                       chan_wgt=20,
-                                                       exclude_outliers=False,
-                                                       expand_mask=False,
-                                                       subchannelmean=subchannelmean,
-                                                       fc=(90, 100, 51000, 52000))
+                                                       expand_mask=expand_mask, filter_sig=filter_sig, threshold=threshold, subchannelmean=subchannelmean, fc=(f1a, f1b, f2a, f2b))
+
+            if aggressiveness >= 7:
+                cleaned_image, mask = clean_full_frame_alt(detector, cleaned_image, mask,
+                                                           npix_iter=npix_iter,
+                                                           minfrac=minfrac_fullarray,
+                                                           chan_wgt=20,
+                                                           exclude_outliers=False,
+                                                           expand_mask=False,
+                                                           subchannelmean=subchannelmean,
+                                                           fc=(90, 100, 51000, 52000))
 
         else:
             # Clean a subarray image
@@ -565,7 +575,21 @@ def do_correction(input_model, mask_spectral_regions, n_sigma, save_mask, user_m
                 output_model.data[i] = cleaned_image
             else:
                 output_model.data = cleaned_image
+                
+        if len(input_model.data.shape) == 3:
+            Mask[i] = mask
+        else:
+            Mask = mask
 
+    # Store the mask image in a model, if requested
+    if save_mask:
+        if len(Mask.shape) == 3:
+            mask_model = datamodels.CubeModel(data=Mask)
+        else:
+            mask_model = datamodels.ImageModel(data=Mask)
+    else:
+        mask_model = None
+                
     # Restore NaN's from original image
     output_model.data[nan_pix] = np.nan
 
